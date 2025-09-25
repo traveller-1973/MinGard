@@ -26,7 +26,7 @@ class Tensor:
             self.data = self.d.asarray(data, dtype=dtype)
 
         self.grad = (
-            self.d.zeros_like(data, dtype=dtype)
+            self.d.zeros_like(self.data, dtype=dtype)
             if self._r_grad
             else None
         )
@@ -66,9 +66,9 @@ class Tensor:
         return self
     
     def __str__(self):
-        device_str = f", device={self.device}" if self.device == "cuda" else ""
+        device_str = f", device='{self.device}'" if "cuda" in self.device else ""
         grad_str = ", requires_grad=True" if self.requires_grad else ""
-        return f"tensor{repr(self.data)[5:-1]}{device_str}{grad_str})"
+        return f"tensor({repr(self.data)[6:-1]}{device_str}{grad_str})"
     
     def __repr__(self):
         return self.__str__()
@@ -341,11 +341,11 @@ class Tensor:
     
             if self.requires_grad and self.grad_enabled:
                 expand_dims = dim if dim and not keepdims else ()
-    
+                # The number of elements that were averaged over
+                n = self.data.shape[dim] if dim is not None else self.data.size
+
                 def backward():
-                    self.grad += self.d.ones_like(self.grad) * self.d.expand_dims(
-                        out.grad, axis=expand_dims
-                    )
+                    self.grad += self.d.expand_dims(out.grad, axis=expand_dims) / n # 均值是对单个元素求导，导数值为1/n
     
                 out._backward = backward
                 out.requires_grad_(True)
@@ -355,16 +355,19 @@ class Tensor:
     # 沿着指定轴求方差，未指定维度时全部求方差，keepdims表示是否保留维度
     def var(self, dim=None, keepdims=False, dtype=None):
         
-        var_val = self.d.var(self.data, axis=dim, keepdims=keepdims, dtype=dtype)
+        var_val = self.d.var(self.data, axis=dim, keepdims=keepdims, dtype=dtype, ddof=1)
         out = Tensor(var_val, self.device, self.dtype, (self,))
 
         if self.requires_grad and self.grad_enabled:
             expand_dims = dim if dim and not keepdims else ()
+            n = self.data.shape[dim] if dim is not None else self.data.size
 
             def backward():
+                mean_val = self.d.mean(self.data, axis=dim, keepdims=True)
+                denominator = n - 1 if n > 1 else 1 
                 self.grad += self.d.expand_dims(
                     out.grad, axis=expand_dims
-                ) * 2 * (self.data - self.d.expand_dims(out.data, axis=expand_dims)) / self.data.size
+                ) * 2 * (self.data - mean_val) / denominator
 
             out._backward = backward
             out.requires_grad_(True)
@@ -458,6 +461,7 @@ class Tensor:
                         if other.requires_grad:
                             other.grad += self.data*out.grad
                 else:
+                    # 广播后的梯度计算
                     axis_self, axis_other = broadcast_axis__(self.shape, other.shape)
                     def backward():
                         if self.requires_grad:
