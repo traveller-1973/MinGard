@@ -20,9 +20,13 @@ class Tensor:
         self._backward = lambda: None
         self._prev = set([p for p in _prev if p.requires_grad])
 
-        if isinstance(data, list) and isinstance(data[0], Tensor):
+        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], Tensor):
             self.stack(data)
         else:
+            if isinstance(data, Tensor):
+                data = data.data
+            if 'cupy' in str(type(data)) and self.device == 'cpu':
+                data = data.get()
             self.data = self.d.asarray(data, dtype=dtype)
 
         self.grad = (
@@ -140,6 +144,7 @@ class Tensor:
     def _check(
         self, other, raise_error_right_away=False, if_tensor=False, if_same_device=False
     ):
+        error_str = "Invalid tensor operation."
         if if_tensor and (not isinstance(other, Tensor)):
             raise_error_right_away = True
             error_str = "Unsupported datatype; Expected a Tensor."
@@ -160,8 +165,7 @@ class Tensor:
                 def backward():
                     if isinstance(index, slice):
                         # 处理切片操作的反向传播
-                        grad_slice = self.grad[index] 
-                        grad_slice += out.grad
+                        self.grad[index]  += out.grad
                     else:
                         # 处理整数索引操作的反向传播
                         self.grad[index] += out.grad
@@ -191,6 +195,10 @@ class Tensor:
         elif isinstance(index, Tensor):
             # 处理张量索引操作
             # data = index.data.copy()
+            if 'cupy' in str(type(index.data)) and self.device == 'cpu':
+                index = index.data.get()
+            elif 'numpy' in str(type(index.data)) and self.device != 'cpu':
+                index = self.d.asarray(index.data)
             out_data = self.data[index.data.astype(int)]
             out = Tensor(out_data, self.device, self.dtype, _prev=(self,))
             if self.requires_grad and self.grad_enabled:
@@ -228,6 +236,14 @@ class Tensor:
     def masked_fill(self, mask, value):
         # mask 是一个布尔numpy或cupy数组，value 是一个标量
         data = self.data.copy()
+
+        if isinstance(mask, Tensor):
+            mask = mask.data
+
+        if 'cupy' in str(type(mask)) and self.device == 'cpu':
+            mask = mask.get()
+        elif 'numpy' in str(type(mask)) and self.device != 'cpu':
+            mask = self.d.asarray(mask)
             
         # 在 mask 的前面扩展维度
         mask_expanded = self.d.broadcast_to(mask, self.data.shape)
@@ -319,7 +335,8 @@ class Tensor:
         if not all(t.dtype == tensors[0].dtype for t in tensors):
             raise ValueError("All elements must be of the same dtype")
         
-        out = Tensor(np.concatenate([t.data for t in tensors], axis=dim), tensors[0].device, tensors[0].dtype)
+        backend = tensors[0].d
+        out = Tensor(backend.concatenate([t.data for t in tensors], axis=dim), tensors[0].device, tensors[0].dtype)
         
         if any(t.requires_grad for t in tensors) and Tensor.grad_enabled:
             def backward():
@@ -432,7 +449,7 @@ class Tensor:
                             other.grad += out.grad.sum(axis=axis_other).reshape(other.shape)
                 out._backward = backward
                 out.requires_grad_(True)
-                return out
+            return out
         else:
             self._check(None, raise_error_right_away=True)
 
@@ -473,7 +490,7 @@ class Tensor:
                             other.grad += (out.grad*self.data).sum(axis=axis_other).reshape(other.shape)
                 out._backward = backward
                 out.requires_grad_(True)
-                return out
+            return out
         else:
             self._check(None, raise_error_right_away=True)
 

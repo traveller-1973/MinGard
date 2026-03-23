@@ -4,7 +4,7 @@ from __init__ import get_d__
 
 
 class Optimizer:
-    def __init__(self, parameters, lr, device: str):
+    def __init__(self, parameters, lr, device: str = None):
         """
         Base class for optimizers.
 
@@ -13,8 +13,10 @@ class Optimizer:
             lr (float): Learning rate for optimization.
             device (str): Device on which the optimizer's computations should be performed.
         """
+        self.parameters = list(parameters)
+        if device is None:
+            device = self.parameters[0].device if len(self.parameters) > 0 else "cpu"
         self.d, self.device = get_d__(device)
-        self.parameters = parameters
         self.lr = lr
 
     def step(self):
@@ -29,7 +31,7 @@ class Optimizer:
             p.grad = self.d.zeros_like(p.grad)
             
 class SGD(Optimizer):
-    def __init__(self, parameters, lr, momentum=0.9, device="cpu"):
+    def __init__(self, parameters, lr, momentum=0.9, device=None):
         """
         Stochastic Gradient Descent (SGD) optimizer.
 

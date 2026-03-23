@@ -1,3 +1,8 @@
+import pickle
+from collections import OrderedDict
+from typing import Optional, Set
+import numpy as np
+
 from engine.Tensor import Tensor
 from utils import get_device
 
@@ -18,31 +23,194 @@ class Module:
         Reset gradients of all tensors in the module to zero.
         """
         for p in self.parameters():
-            p.grad = 0
+            if p.grad is not None:
+                p.grad.fill(0)
 
     def parameters(self):
-        
-        # 有梯度的张量才需要后续处理
+        """
+        Return a list of tensors that require gradients.
+        """
+        return [tensor for _, tensor in self.named_parameters()]
 
-        return [t for t in self._get_tensors() if t.requires_grad]
+    def named_parameters(self, prefix: str = ""):
+        """
+        Yield tuples of (name, tensor) for all parameters that require gradients.
+        """
+        yield from (
+            (name, tensor)
+            for name, tensor in self._named_tensors(prefix=prefix)
+            if tensor.requires_grad
+        )
+
+    def named_children(self):
+        """Yield tuples of (name, child_module) for all direct submodules."""
+        memo: Set[int] = set()
+        for attr_name, value in self.__dict__.items():
+            if attr_name in {"d", "device"}:
+                continue
+
+            if isinstance(value, Module):
+                if id(value) in memo:
+                    continue
+                memo.add(id(value))
+                yield attr_name, value
+            elif isinstance(value, (list, tuple)):
+                for idx, element in enumerate(value):
+                    if isinstance(element, Module):
+                        if id(element) in memo:
+                            continue
+                        memo.add(id(element))
+                        yield f"{attr_name}.{idx}", element
+            elif isinstance(value, dict):
+                for key, element in value.items():
+                    if isinstance(element, Module):
+                        if id(element) in memo:
+                            continue
+                        memo.add(id(element))
+                        yield f"{attr_name}.{key}", element
+
+    def children(self):
+        """Yield direct child modules."""
+        for _, module in self.named_children():
+            yield module
+
+    def extra_repr(self) -> str:
+        """Return the string displayed in the module repr after the name."""
+        return ""
+
+    def __repr__(self) -> str:  # pragma: no cover - representation helper
+        lines = []
+        children = list(self.named_children())
+        extra_repr = self.extra_repr()
+        if extra_repr:
+            lines.extend(extra_repr.split("\n"))
+
+        for name, child in children:
+            child_repr = repr(child)
+            child_repr = self._addindent(child_repr, 2)
+            lines.append(f"({name}): {child_repr}")
+
+        main_str = f"{self.__class__.__name__}("
+        if children:
+            main_str += "\n  " + "\n  ".join(lines) + "\n"
+        elif lines:
+            if len(lines) == 1:
+                main_str += lines[0]
+            else:
+                main_str += "\n  " + "\n  ".join(lines) + "\n"
+        main_str += ")"
+        return main_str
+
+    @staticmethod
+    def _addindent(text: str, num_spaces: int) -> str:
+        lines = text.split("\n")
+        if len(lines) == 1:
+            return text
+        indent = " " * num_spaces
+        return lines[0] + "\n" + "\n".join(indent + line for line in lines[1:])
+
+    def _named_tensors(self, memo: Optional[Set[int]] = None, prefix: str = ""):
+        if memo is None: #防止权重共享时重复访问同一Tensor
+            memo = set()
+
+        for attr_name, value in self.__dict__.items():
+            if attr_name in {"d", "device"}:
+                continue
+
+            name = f"{prefix}{attr_name}" if prefix else attr_name
+
+            if isinstance(value, Tensor):
+                if id(value) in memo:
+                    continue
+                memo.add(id(value))
+                yield name, value
+            elif isinstance(value, Module):
+                yield from value._named_tensors(memo, prefix=f"{name}.")
+            elif isinstance(value, (list, tuple)):
+                for idx, element in enumerate(value):
+                    indexed_name = f"{name}.{idx}"
+                    if isinstance(element, Tensor):
+                        if id(element) in memo:
+                            continue
+                        memo.add(id(element))
+                        yield indexed_name, element
+                    elif isinstance(element, Module):
+                        yield from element._named_tensors(
+                            memo, prefix=f"{indexed_name}."
+                        )
+            elif isinstance(value, dict):
+                for key, element in value.items():
+                    indexed_name = f"{name}.{key}"
+                    if isinstance(element, Tensor):
+                        if id(element) in memo:
+                            continue
+                        memo.add(id(element))
+                        yield indexed_name, element
+                    elif isinstance(element, Module):
+                        yield from element._named_tensors(
+                            memo, prefix=f"{indexed_name}."
+                        )
 
     def _get_tensors(self):
-        # 检索Module中的所有张量
-        tensors = []
+        return [tensor for _, tensor in self._named_tensors()]
 
-        # __dict__是一个包含对象的所有属性的字典
-        for _, val in self.__dict__.items():
-            if isinstance(val, Tensor):
-                tensors.append(val)
-            elif isinstance(val, Module):
-                # 如果属性是Module的子类实例,递归调用_get_tensors
-                tensors.extend(val._get_tensors())
-            elif isinstance(val, list):
-                for element in val:
-                    if isinstance(element, Module):
-                        tensors.extend(element._get_tensors())
+    def state_dict(self, keep_vars: bool = False):
+        """
+        Return an OrderedDict containing copies of the module's parameters.
+        """
+        state = OrderedDict()
+        for name, tensor in self._named_tensors():
+            state[name] = tensor if keep_vars else self._tensor_to_numpy(tensor)
+        return state
 
-        return tensors
+    def load_state_dict(self, state_dict: dict, strict: bool = True):
+        """Load parameters from *state_dict* into current module."""
+        name_to_tensor = dict(self._named_tensors())
+        missing_keys = []
+        unexpected_keys = []
+
+        for name, tensor in name_to_tensor.items():
+            if name not in state_dict:
+                if strict:
+                    missing_keys.append(name)
+                continue
+
+            param = state_dict[name]
+            array = self._to_numpy_array(param)
+
+            if tensor.shape != array.shape:
+                raise ValueError(
+                    f"Shape mismatch for parameter '{name}': "
+                    f"expected {tensor.shape}, got {array.shape}."
+                )
+
+            tensor.data = tensor.d.asarray(array, dtype=tensor.dtype)
+            if tensor.grad is not None:
+                tensor.grad = tensor.d.zeros_like(tensor.data)
+
+        if strict:
+            unexpected_keys = [name for name in state_dict.keys() if name not in name_to_tensor]
+            if missing_keys or unexpected_keys:
+                raise KeyError(
+                    "Error(s) in loading state_dict: "
+                    + (f"Missing keys: {missing_keys}. " if missing_keys else "")
+                    + (f"Unexpected keys: {unexpected_keys}." if unexpected_keys else "")
+                )
+
+    @staticmethod
+    def _tensor_to_numpy(tensor: Tensor):
+        data = tensor.data
+        if hasattr(data, "get"):
+            data = data.get()
+        return np.array(data, copy=True)
+
+    @staticmethod
+    def _to_numpy_array(value):
+        if isinstance(value, Tensor):
+            value = value.data
+        if hasattr(value, "get"):
+            value = value.get()
+        return np.array(value, copy=False)
 
     def to(self, device: str):
 
@@ -66,23 +234,32 @@ class Linear(Module):
     ):
         super().__init__(device)
         self.bias = bias
+        limit = (1 / in_features) ** 0.5
         self.W = Tensor(
-            self.d.random.uniform(-1, 1, (in_features, out_features)),
+            self.d.random.uniform(-limit, limit, (in_features, out_features)),
             device,
             dtype,
             requires_grad=True,
         )
         if self.bias:
             self.b = Tensor(
-                self.d.random.uniform(-1, 1, (1, out_features)),
+                self.d.random.uniform(-limit, limit, (1, out_features)),
                 device,
                 dtype,
                 requires_grad=True,
             )
 
     def __call__(self, X: Tensor):
-        out = X @ self.W + self.b
+        out = X @ self.W
+        if self.bias:
+            out += self.b
         return out
+
+    def extra_repr(self) -> str:
+        in_features, out_features = self.W.shape
+        return (
+            f"in_features={in_features}, out_features={out_features}, bias={self.bias}"
+        )
     
 class Embedding(Module):
     # Embedding层，将输入的索引转换为对应的embedding向量
@@ -92,8 +269,9 @@ class Embedding(Module):
         super().__init__(device)
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
+        limit = (1 / embedding_dim) ** 0.5
         self.weight = Tensor(
-            self.d.random.uniform(-1, 1, (num_embeddings, embedding_dim)),
+            self.d.random.uniform(-limit, limit, (num_embeddings, embedding_dim)),
             device,
             dtype,
             requires_grad=True,
@@ -101,6 +279,11 @@ class Embedding(Module):
 
     def __call__(self, indices: Tensor):
         return self.weight[indices]
+
+    def extra_repr(self) -> str:
+        return (
+            f"num_embeddings={self.num_embeddings}, embedding_dim={self.embedding_dim}"
+        )
     
     # def __getitem__(self, indices):
     #     return self.weight[indices]
@@ -113,6 +296,9 @@ class Parameter(Module):
 
     def __call__(self):
         return self.data
+
+    def extra_repr(self) -> str:
+        return f"shape={self.data.shape}, dtype={self.data.dtype}"
     
 
 class ModuleList(Module):
@@ -128,3 +314,34 @@ class ModuleList(Module):
     
     def __iter__(self):
         return iter(self.modules)
+    
+    def named_children(self):
+        seen: Set[int] = set()
+        for idx, module in enumerate(self.modules):
+            if not isinstance(module, Module):
+                continue
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            yield str(idx), module
+
+    def _get_tensors(self):
+        tensors = []
+        for module in self.modules:
+            tensors.extend(module._get_tensors())
+        return tensors
+
+
+def save_state_dict(module: Module, file_path: str):
+    """Persist the module's parameters to disk."""
+    state = module.state_dict()
+    with open(file_path, "wb") as f:
+        pickle.dump(state, f)
+
+
+def load_state_dict(module: Module, file_path: str, strict: bool = True):
+    """Load module parameters from *file_path* into *module*."""
+    with open(file_path, "rb") as f:
+        state = pickle.load(f)
+    module.load_state_dict(state, strict=strict)
+
